@@ -1,0 +1,132 @@
+#!/bin/bash
+
+# Cấu hình mã màu hiển thị terminal
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Đường dẫn cố định tới cấu hình binary
+HTTPX="$HOME/go/bin/httpx"
+MAX_DEPTH=7 # Tăng giới hạn đệ quy lên 7 vòng để theo dõi sâu hơn
+GLOBAL_HISTORY="processed_urls.txt"
+INITIAL_INPUT="initial_subs.txt"
+
+# Khởi tạo/Xóa trắng file lịch sử quét toàn cục
+> "$GLOBAL_HISTORY"
+
+echo -e "${YELLOW}[*] Khởi động hệ thống phân tích Redirect Đệ quy (Bản vá lỗi Logic Loop)...${NC}"
+
+# Kiểm tra các điều kiện tiên quyết
+if [ ! -x "$HTTPX" ]; then
+    echo -e "${RED}[-][Lỗi] Không tìm thấy binary Go httpx tại: $HTTPX${NC}"
+    exit 1
+fi
+
+if ! command -v jq &> /dev/null; then
+    echo -e "${RED}[-][Lỗi] Công cụ 'jq' chưa được cài đặt. Vui lòng chạy: sudo apt install jq${NC}"
+    exit 1
+fi
+
+# Bước chuẩn bị: Thu thập tất cả subdomain từ các file 3xx hiện tại ở thư mục gốc
+echo -e "${YELLOW}[*] Đang thu thập dữ liệu ban đầu từ các file sub_30*.txt...${NC}"
+if ls sub_30*.txt >/dev/null 2>&1; then
+    cat sub_30*.txt | awk '{print $1}' | sort -u > "$INITIAL_INPUT"
+    echo -e "${GREEN}[+] Đã thiết lập danh sách gốc với $(wc -l < "$INITIAL_INPUT") mục tiêu.${NC}"
+else
+    echo -e "${RED}[-][Lỗi] Không tìm thấy file sub_30*.txt nào tại thư mục hiện tại để làm dữ liệu gốc.${NC}"
+    exit 1
+fi
+
+round=1
+current_inputs="$INITIAL_INPUT"
+
+while [ -s "$current_inputs" ]; do
+    echo -e "\n${BLUE}==================================================${NC}"
+    echo -e "${BLUE}▶ BẮT ĐẦU VÒNG QUÉT ĐỆ QUY THỨ: $round (Max Depth: $MAX_DEPTH)${NC}"
+    echo -e "${BLUE}==================================================${NC}"
+    
+    if [ $round -gt $MAX_DEPTH ]; then
+        echo -e "${RED}[-][Cảnh báo] Đã đạt đến giới hạn vòng lặp tối đa ($MAX_DEPTH). Tiến trình dừng lại.${NC}"
+        break
+    fi
+
+    # [BẢN VÁ LỖI]: Ghi nhận các URL NGUỒN của vòng này vào History.
+    # Điều này đảm bảo chúng ta không bao giờ dùng lại các URL này làm Nguồn ở các vòng sau.
+    cat "$current_inputs" >> "$GLOBAL_HISTORY"
+    sort -u "$GLOBAL_HISTORY" -o "$GLOBAL_HISTORY"
+
+    round_dir="round_${round}"
+    mkdir -p "$round_dir"
+    
+    echo -e "${YELLOW}[*] Thư mục lưu trữ vòng này: ./${round_dir}/${NC}"
+    echo -e "${YELLOW}[*] Đang thực thi httpx phân tích cấu trúc Location Header...${NC}"
+    
+    # 1. Quét tìm vị trí dịch chuyển và xuất JSON
+    "$HTTPX" -l "$current_inputs" -location -json -silent > "$round_dir/raw_redirects.json"
+    
+    # 2. Trích xuất duy nhất các URL đích (Location)
+    jq -r 'select(.location != null) | .location' "$round_dir/raw_redirects.json" | sort -u > "$round_dir/redirect_destinations.txt"
+    
+    if [ ! -s "$round_dir/redirect_destinations.txt" ]; then
+        echo -e "${GREEN}[+] Không phát hiện thêm bất kỳ Location Header nào tại Vòng $round. Chuỗi chuyển hướng kết thúc.${NC}"
+        break
+    fi
+    
+    echo -e "${GREEN}[+] Trích xuất thành công $(wc -l < "$round_dir/redirect_destinations.txt") URL đích chuyển hướng.${NC}"
+    echo -e "${YELLOW}[*] Đang kiểm tra trạng thái hoạt động (HTTP Status) của các URL đích này...${NC}"
+    
+    # 3. Quét kiểm tra trạng thái hiện tại của các URL đích
+    "$HTTPX" -l "$round_dir/redirect_destinations.txt" -status-code -title -json -silent > "$round_dir/alive_results.json"
+    
+    # Kết xuất file text tường minh
+    jq -r '"\(.url) [\(.status_code)] [\(.title // "No Title")]"' "$round_dir/alive_results.json" > "$round_dir/alive_destinations.txt"
+
+    # 4. Kiểm tra mã 3xx tiếp diễn
+    has_3xx=$(jq -r 'select(.status_code >= 300 and .status_code < 400) | .url' "$round_dir/alive_results.json")
+    
+    if [ -z "$has_3xx" ]; then
+        echo -e "${GREEN}[+] Tuyệt vời! Tất cả các URL đích ở Vòng $round đã phân rã về mã trạng thái cuối cùng (200/404/500/v.v.).${NC}"
+        break
+    fi
+    
+    echo -e "${YELLOW}[*] Phát hiện mã 3xx tiếp diễn. Đang phân loại dữ liệu chi tiết...${NC}"
+    next_raw_inputs="$round_dir/next_raw_inputs.txt"
+    > "$next_raw_inputs"
+    
+    for code in 301 302 307 308; do
+        jq -r --argjson sc "$code" 'select(.status_code == $sc) | "\(.url) [\(.status_code)]"' "$round_dir/alive_results.json" > "$round_dir/sub_${code}.txt"
+        
+        if [ ! -s "$round_dir/sub_${code}.txt" ]; then
+            rm -f "$round_dir/sub_${code}.txt"
+        else
+            echo -e "    -> Tạo tệp tin: ./${round_dir}/sub_${code}.txt ($(wc -l < "$round_dir/sub_${code}.txt") mục tiêu)"
+            # Đẩy các URL sạch vào danh sách chuẩn bị cho vòng đệ quy kế tiếp
+            jq -r --argjson sc "$code" 'select(.status_code == $sc) | .url' "$round_dir/alive_results.json" >> "$next_raw_inputs"
+        fi
+    done
+    
+    # 5. [BẢN VÁ LỖI]: Lọc các mục tiêu 3xx của vòng này dựa trên History.
+    # Chỉ loại bỏ những URL đã từng được dùng làm NGUỒN quét (tồn tại trong GLOBAL_HISTORY).
+    next_filtered_inputs="$round_dir/next_filtered_inputs.txt"
+    if [ -s "$next_raw_inputs" ]; then
+        sort -u "$next_raw_inputs" > "$round_dir/temp.txt"
+        grep -Fvxf "$GLOBAL_HISTORY" "$round_dir/temp.txt" > "$next_filtered_inputs" 2>/dev/null
+        rm -f "$round_dir/temp.txt"
+    fi
+    
+    if [ -s "$next_filtered_inputs" ]; then
+        current_inputs="$next_filtered_inputs"
+        ((round++))
+    else
+        echo -e "${GREEN}[+] Các mã 3xx thu được đều trỏ về các URL đã từng quét trước đó (phát hiện Loop). Tiến trình dừng lại an toàn.${NC}"
+        break
+    fi
+done
+
+# Dọn dẹp tệp tin cấu hình tạm
+rm -f "$INITIAL_INPUT"
+
+echo -e "\n${GREEN}[+] TIẾN TRÌNH HOÀN TẤT HOÀN TOÀN!${NC}"
+echo -e "${GREEN}[+] Tổng số vòng quét đệ quy thực hiện: $round ${NC}"
